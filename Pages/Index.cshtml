@@ -23,6 +23,7 @@
                         <div>
                             <button type="button" class="btn btn-primary" id="connectBtn">Connect</button>
                             <button type="button" class="btn btn-secondary" id="voiceToggleBtn" disabled>🎤 Start Voice</button>
+                            <button type="button" class="btn btn-outline-info" id="downloadBtn" disabled>📥 Download History</button>
                         </div>
                     </div>
                 </div>
@@ -68,7 +69,7 @@
             this.bindEvents();
             this.checkStatus();
             this.initializeAudio();
-            
+
         }
 
         async initializeAudio(){
@@ -102,12 +103,14 @@
             this.connectionStatus = document.getElementById('connectionStatus');
             this.voiceStatus = document.getElementById('voiceStatus');
             this.audioPlayer = document.getElementById('audioPlayer');
+            this.downloadBtn = document.getElementById('downloadBtn');
         }
 
         bindEvents() {
             this.connectBtn.addEventListener('click', () => this.toggleConnection());
             this.voiceToggleBtn.addEventListener('click', () => this.toggleVoice());
             this.sendBtn.addEventListener('click', () => this.sendMessage());
+            this.downloadBtn.addEventListener('click', () => this.downloadConversationHistory());
             this.messageInput.addEventListener('keypress', (e) => {
                 if (e.key === 'Enter') this.sendMessage();
             });
@@ -176,9 +179,9 @@
 
                 if (response.ok) {
                     this.isRecording = result.isRecording;
+                    if(this.isRecording) await this.sendMessage('Hello');
                     this.updateUI(this.isConnected, this.isRecording);
-                    this.addMessage('system', result.message);
-                    await this.sendMessage('Hello');
+                    this.addMessage('system', result.message);                    
                 } else {
                     this.addMessage('error', `Voice toggle failed: ${result.error}`);
                 }
@@ -187,12 +190,52 @@
             }
         }
 
+        async downloadConversationHistory() {
+            try {
+                const response = await fetch('/api/chat/history');
+                const result = await response.json();
+
+                if (response.ok && result.conversationHistory && result.conversationHistory.length > 0) {
+                    // Create formatted content for download
+                    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+                    const content = this.formatHistoryForDownload(result.conversationHistory, timestamp);
+                    
+                    // Create and trigger download
+                    const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+                    const url = URL.createObjectURL(blob);
+                    const link = document.createElement('a');
+                    link.href = url;
+                    link.download = `conversation-history-${timestamp}.txt`;
+                    document.body.appendChild(link);
+                    link.click();
+                    document.body.removeChild(link);
+                    URL.revokeObjectURL(url);
+
+                    this.addMessage('system', `Downloaded conversation history (${result.messageCount} messages)`);
+                } else {
+                    this.addMessage('system', 'No conversation history available to download');
+                }
+            } catch (error) {
+                this.addMessage('error', `Download error: ${error.message}`);
+            }
+        }
+
+        formatHistoryForDownload(history, timestamp) {
+            const header = `Voice Live Chat Conversation History\nExported: ${new Date().toLocaleString()}\n${'='.repeat(50)}\n\n`;
+            const messages = history.map((message, index) => `${index + 1}. ${message}`).join('\n');
+            const footer = `\n\n${'='.repeat(50)}\nEnd of conversation (${history.length} messages)`;
+            
+            return header + messages + footer;
+        }
+
         async sendMessage(messageOverride = null) {
             const message = messageOverride || this.messageInput.value.trim();
             if (!message || !this.isConnected) return;
             try {
-                this.addMessage('user', message);
-                if (!messageOverride) this.messageInput.value = '';
+                if(!messageOverride) {
+                    this.addMessage('user', message);
+                    this.messageInput.value = '';
+                }
                 const response = await fetch('/api/chat/send-message', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -366,6 +409,9 @@
 
             this.voiceToggleBtn.textContent = recording ? '🔇 Stop Voice' : '🎤 Start Voice';
             this.voiceToggleBtn.disabled = !connected;
+
+            // Update download button - only enabled when disconnected
+            this.downloadBtn.disabled = connected;
 
             // Update input
             this.messageInput.disabled = !connected;

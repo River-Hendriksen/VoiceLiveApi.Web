@@ -4,6 +4,7 @@ using Microsoft.CognitiveServices.Speech.Audio;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
+using VoiceLiveApi.Web.Services;
 
 namespace VoiceLiveApi.Web.Controllers
 {
@@ -13,6 +14,7 @@ namespace VoiceLiveApi.Web.Controllers
     {
         private readonly IConfiguration _configuration;
         private readonly ILogger<ChatController> _logger;
+        private readonly IConversationHistoryService _conversationHistoryService;
         
         // Single-user session state
         private static ClientWebSocket? _currentWebSocket;
@@ -21,10 +23,11 @@ namespace VoiceLiveApi.Web.Controllers
         private static bool _isRecording = false;
         private static readonly object _lock = new object();
 
-        public ChatController(IConfiguration configuration, ILogger<ChatController> logger)
+        public ChatController(IConfiguration configuration, ILogger<ChatController> logger, IConversationHistoryService conversationHistoryService)
         {
             _configuration = configuration;
             _logger = logger;
+            _conversationHistoryService = conversationHistoryService;
         }
 
         [HttpPost("connect")]
@@ -52,6 +55,7 @@ namespace VoiceLiveApi.Web.Controllers
                 lock (_lock)
                 {
                     _currentWebSocket = webSocket;
+                    _conversationHistoryService.ClearHistory();
                 }
 
                 // Configure the session
@@ -330,6 +334,8 @@ namespace VoiceLiveApi.Web.Controllers
                         return null;
 
                     case "response.done":
+                        var response = doc.RootElement.GetProperty("response").GetProperty("output")[0].GetProperty("content")[0].GetProperty("transcript");
+                        _conversationHistoryService.AddMessage($"FAMILY: {response}");
                         return new { type = "response_completed", message = "Response completed" };
 
                     case "error":
@@ -452,6 +458,8 @@ namespace VoiceLiveApi.Web.Controllers
 
                 await SendWebSocketMessage(webSocket, conversationItem);
 
+                _conversationHistoryService.AddMessage($"LEARNER: {text}");
+
                 var responseCreate = new
                 {
                     type = "response.create",
@@ -499,13 +507,27 @@ namespace VoiceLiveApi.Web.Controllers
             {
                 if (_currentWebSocket.State == WebSocketState.Open)
                 {
-                    await _currentWebSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Session ended", CancellationToken.None);
+                    await _currentWebSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Session ended", CancellationToken.None);                    
                 }
                 _currentWebSocket.Dispose();
                 _currentWebSocket = null;
             }
 
             _audioBuffer.Clear();
+        }
+
+        [HttpGet("history")]
+        public IActionResult GetConversationHistory()
+        {
+            var history = _conversationHistoryService.GetHistory().Skip(1).ToList();
+            return Ok(new { conversationHistory = history, messageCount = history.Count });
+        }
+
+        [HttpPost("clear-history")]
+        public IActionResult ClearConversationHistory()
+        {
+            _conversationHistoryService.ClearHistory();
+            return Ok(new { message = "Conversation history cleared" });
         }
     }
 

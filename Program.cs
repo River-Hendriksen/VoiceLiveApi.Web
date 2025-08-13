@@ -1,3 +1,5 @@
+using VoiceLiveApi.Web.Services;
+
 namespace VoiceLiveApi.Web
 {
     public class Program
@@ -9,6 +11,9 @@ namespace VoiceLiveApi.Web
             // Add services to the container.
             builder.Services.AddRazorPages();
             builder.Services.AddControllers();
+            
+            // Register conversation history service as singleton
+            builder.Services.AddSingleton<IConversationHistoryService, ConversationHistoryService>();
 
             var app = builder.Build();
 
