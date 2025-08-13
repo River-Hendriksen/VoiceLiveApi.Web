@@ -57,302 +57,324 @@
 </div>
 
 <script>
-class VoiceLiveChat {
-    constructor() {
-        this.isConnected = false;
-        this.isRecording = false;
-        this.eventSource = null;
-        this.currentTextResponse = '';
-        
-        this.initializeElements();
-        this.bindEvents();
-        this.checkStatus();
-    }
-
-    initializeElements() {
-        this.connectBtn = document.getElementById('connectBtn');
-        this.voiceToggleBtn = document.getElementById('voiceToggleBtn');
-        this.messageInput = document.getElementById('messageInput');
-        this.sendBtn = document.getElementById('sendBtn');
-        this.chatMessages = document.getElementById('chatMessages');
-        this.connectionStatus = document.getElementById('connectionStatus');
-        this.voiceStatus = document.getElementById('voiceStatus');
-        this.audioPlayer = document.getElementById('audioPlayer');
-    }
-
-    bindEvents() {
-        this.connectBtn.addEventListener('click', () => this.toggleConnection());
-        this.voiceToggleBtn.addEventListener('click', () => this.toggleVoice());
-        this.sendBtn.addEventListener('click', () => this.sendMessage());
-        this.messageInput.addEventListener('keypress', (e) => {
-            if (e.key === 'Enter') this.sendMessage();
-        });
-    }
-
-    async checkStatus() {
-        try {
-            const response = await fetch('/api/chat/status');
-            const status = await response.json();
-            this.updateUI(status.isConnected, status.isRecording);
-        } catch (error) {
-            console.error('Error checking status:', error);
-        }
-    }
-
-    async toggleConnection() {
-        if (this.isConnected) {
-            await this.disconnect();
-        } else {
-            await this.connect();
-        }
-    }
-
-    async connect() {
-        try {
-            this.addMessage('system', 'Connecting to Voice Live API...');
-            const response = await fetch('/api/chat/connect', { method: 'POST' });
-            const result = await response.json();
-            
-            if (response.ok) {
-                this.isConnected = true;
-                this.updateUI(true, false);
-                this.addMessage('system', result.message);
-                this.startEventStream();
-            } else {
-                this.addMessage('error', `Connection failed: ${result.error}`);
-            }
-        } catch (error) {
-            this.addMessage('error', `Connection error: ${error.message}`);
-        }
-    }
-
-    async disconnect() {
-        try {
-            if (this.eventSource) {
-                this.eventSource.close();
-                this.eventSource = null;
-            }
-            
-            const response = await fetch('/api/chat/disconnect', { method: 'POST' });
-            const result = await response.json();
-            
+    class VoiceLiveChat {
+        constructor() {
             this.isConnected = false;
             this.isRecording = false;
-            this.updateUI(false, false);
-            this.addMessage('system', result.message || 'Disconnected');
-        } catch (error) {
-            this.addMessage('error', `Disconnect error: ${error.message}`);
-        }
-    }
+            this.eventSource = null;
+            this.currentTextResponse = '';
 
-    async toggleVoice() {
-        try {
-            const response = await fetch('/api/chat/toggle-voice', { method: 'POST' });
-            const result = await response.json();
+            this.initializeElements();
+            this.bindEvents();
+            this.checkStatus();
+            this.initializeAudio();
             
-            if (response.ok) {
-                this.isRecording = result.isRecording;
-                this.updateUI(this.isConnected, this.isRecording);
-                this.addMessage('system', result.message);
-            } else {
-                this.addMessage('error', `Voice toggle failed: ${result.error}`);
-            }
-        } catch (error) {
-            this.addMessage('error', `Voice error: ${error.message}`);
         }
-    }
 
-    async sendMessage() {
-        const message = this.messageInput.value.trim();
-        if (!message || !this.isConnected) return;
+        async initializeAudio(){
+            const constraints = {
+                        audio: {
+                            echoCancellation: true,
+                            noiseSuppression: true,
+                            autoGainControl: true,
+                            sampleRate: 44100,
+                            channelCount: 1,
+                            // Additional constraints for better echo cancellation
+                            googEchoCancellation: true,
+                            googAutoGainControl: true,
+                            googNoiseSuppression: true,
+                            googHighpassFilter: true,
+                            googEchoCancellation2: true,
+                            googDAEchoCancellation: true
+                        }
+                    };
 
-        try {
-            this.addMessage('user', message);
-            this.messageInput.value = '';
-            
-            const response = await fetch('/api/chat/send-message', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ message: message })
+            // Request microphone access with enhanced constraints
+            this.mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
+        }
+
+        initializeElements() {
+            this.connectBtn = document.getElementById('connectBtn');
+            this.voiceToggleBtn = document.getElementById('voiceToggleBtn');
+            this.messageInput = document.getElementById('messageInput');
+            this.sendBtn = document.getElementById('sendBtn');
+            this.chatMessages = document.getElementById('chatMessages');
+            this.connectionStatus = document.getElementById('connectionStatus');
+            this.voiceStatus = document.getElementById('voiceStatus');
+            this.audioPlayer = document.getElementById('audioPlayer');
+        }
+
+        bindEvents() {
+            this.connectBtn.addEventListener('click', () => this.toggleConnection());
+            this.voiceToggleBtn.addEventListener('click', () => this.toggleVoice());
+            this.sendBtn.addEventListener('click', () => this.sendMessage());
+            this.messageInput.addEventListener('keypress', (e) => {
+                if (e.key === 'Enter') this.sendMessage();
             });
-            
-            const result = await response.json();
-            if (!response.ok) {
-                this.addMessage('error', `Send failed: ${result.error}`);
-            }
-        } catch (error) {
-            this.addMessage('error', `Send error: ${error.message}`);
         }
-    }
 
-    startEventStream() {
-        this.eventSource = new EventSource('/api/chat/stream');
-        
-        this.eventSource.onmessage = (event) => {
+        async checkStatus() {
             try {
-                const data = JSON.parse(event.data);
-                this.handleServerMessage(data);
+                const response = await fetch('/api/chat/status');
+                const status = await response.json();
+                this.updateUI(status.isConnected, status.isRecording);
             } catch (error) {
-                console.error('Error parsing server message:', error);
+                console.error('Error checking status:', error);
             }
-        };
+        }
 
-        this.eventSource.onerror = (error) => {
-            console.error('EventSource error:', error);
-            if (this.eventSource.readyState === EventSource.CLOSED) {
-                this.addMessage('system', 'Connection lost. Please reconnect.');
-                this.isConnected = false;
-                this.updateUI(false, false);
+        async toggleConnection() {
+            if (this.isConnected) {
+                await this.disconnect();
+            } else {
+                await this.connect();
             }
-        };
-    }
+        }
 
-    handleServerMessage(data) {
-        switch (data.type) {
-            case 'session_created':
-            case 'session_updated':
-                this.addMessage('system', data.message);
-                break;
-                
-            case 'response_started':
-                this.currentTextResponse = '';
-                this.addMessage('assistant', '🤖 Generating response...');
-                break;
-                
-            case 'text_delta':
-                this.updateLastAssistantMessage(data.text);
-                break;
-                
-            case 'audio_response':
-                if (data.audioData) {
-                    this.playAudio(data.audioData);
+        async connect() {
+            try {
+                this.addMessage('system', 'Connecting to Voice Live API...');
+                const response = await fetch('/api/chat/connect', { method: 'POST' });
+                const result = await response.json();
+
+                if (response.ok) {
+                    this.isConnected = true;
+                    this.updateUI(true, false);
+                    this.addMessage('system', result.message);
+                    this.startEventStream();
+                } else {
+                    this.addMessage('error', `Connection failed: ${result.error}`);
                 }
-                break;
-                
-            case 'response_completed':
-                this.addMessage('system', 'Response completed');
-                break;
-                
-            case 'error':
-                this.addMessage('error', `Error: ${data.error}`);
-                break;
-        }
-    }
-
-    updateLastAssistantMessage(textDelta) {
-        this.currentTextResponse += textDelta;
-        const messages = this.chatMessages.children;
-        const lastMessage = messages[messages.length - 1];
-        
-        if (lastMessage && lastMessage.classList.contains('assistant-message')) {
-            const content = lastMessage.querySelector('.message-content');
-            if (content) {
-                content.textContent = this.currentTextResponse;
+            } catch (error) {
+                this.addMessage('error', `Connection error: ${error.message}`);
             }
-        } else {
-            this.addMessage('assistant', this.currentTextResponse);
         }
-    }
 
-    playAudio(base64Audio) {
-        try {
-            const audioBlob = this.base64ToBlob(base64Audio, 'audio/wav');
-            const audioUrl = URL.createObjectURL(audioBlob);
-            this.audioPlayer.src = audioUrl;
-            this.audioPlayer.play();
-            
-            // Cleanup URL after playing
-            this.audioPlayer.addEventListener('ended', () => {
-                URL.revokeObjectURL(audioUrl);
-            }, { once: true });
-        } catch (error) {
-            console.error('Error playing audio:', error);
-        }
-    }
+        async disconnect() {
+            try {
+                if (this.eventSource) {
+                    this.eventSource.close();
+                    this.eventSource = null;
+                }
 
-    base64ToBlob(base64, contentType) {
-        const sliceSize = 1024;
-        const byteCharacters = atob(base64);
-        const bytesLength = byteCharacters.length;
-        const slicesCount = Math.ceil(bytesLength / sliceSize);
-        const byteArrays = new Array(slicesCount);
+                const response = await fetch('/api/chat/disconnect', { method: 'POST' });
+                const result = await response.json();
 
-        for (let sliceIndex = 0; sliceIndex < slicesCount; ++sliceIndex) {
-            const begin = sliceIndex * sliceSize;
-            const end = Math.min(begin + sliceSize, bytesLength);
-            const bytes = new Array(end - begin);
-            for (let offset = begin, i = 0; offset < end; ++i, ++offset) {
-                bytes[i] = byteCharacters[offset].charCodeAt(0);
+                this.isConnected = false;
+                this.isRecording = false;
+                this.updateUI(false, false);
+                this.addMessage('system', result.message || 'Disconnected');
+            } catch (error) {
+                this.addMessage('error', `Disconnect error: ${error.message}`);
             }
-            byteArrays[sliceIndex] = new Uint8Array(bytes);
         }
-        return new Blob(byteArrays, { type: contentType });
-    }
 
-    addMessage(type, content) {
-        const messageDiv = document.createElement('div');
-        messageDiv.className = `mb-3 ${type}-message`;
-        
-        let badgeClass = 'bg-secondary';
-        let icon = '';
-        
-        switch (type) {
-            case 'user':
-                badgeClass = 'bg-primary';
-                icon = '👤';
-                break;
-            case 'assistant':
-                badgeClass = 'bg-success';
-                icon = '🤖';
-                break;
-            case 'system':
-                badgeClass = 'bg-info';
-                icon = 'ℹ️';
-                break;
-            case 'error':
-                badgeClass = 'bg-danger';
-                icon = '⚠️';
-                break;
+        async toggleVoice() {
+            try {
+                const response = await fetch('/api/chat/toggle-voice', { method: 'POST' });
+                const result = await response.json();
+
+                if (response.ok) {
+                    this.isRecording = result.isRecording;
+                    this.updateUI(this.isConnected, this.isRecording);
+                    this.addMessage('system', result.message);
+                    await this.sendMessage('Hello');
+                } else {
+                    this.addMessage('error', `Voice toggle failed: ${result.error}`);
+                }
+            } catch (error) {
+                this.addMessage('error', `Voice error: ${error.message}`);
+            }
         }
-        
-        messageDiv.innerHTML = `
-            <div class="d-flex align-items-start">
-                <span class="badge ${badgeClass} me-2">${icon} ${type.charAt(0).toUpperCase() + type.slice(1)}</span>
-                <div class="message-content flex-grow-1">${content}</div>
-            </div>
-        `;
-        
-        this.chatMessages.appendChild(messageDiv);
-        this.chatMessages.scrollTop = this.chatMessages.scrollHeight;
+
+        async sendMessage(messageOverride = null) {
+            const message = messageOverride || this.messageInput.value.trim();
+            if (!message || !this.isConnected) return;
+            try {
+                this.addMessage('user', message);
+                if (!messageOverride) this.messageInput.value = '';
+                const response = await fetch('/api/chat/send-message', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ message: message })
+                });
+                const result = await response.json();
+                if (!response.ok) {
+                    this.addMessage('error', `Send failed: ${result.error}`);
+                }
+            } catch (error) {
+                this.addMessage('error', `Send error: ${error.message}`);
+            }
+        }
+
+        startEventStream() {
+            this.eventSource = new EventSource('/api/chat/stream');
+
+            this.eventSource.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    this.handleServerMessage(data);
+                } catch (error) {
+                    console.error('Error parsing server message:', error);
+                }
+            };
+
+            this.eventSource.onerror = (error) => {
+                console.error('EventSource error:', error);
+                if (this.eventSource.readyState === EventSource.CLOSED) {
+                    this.addMessage('system', 'Connection lost. Please reconnect.');
+                    this.isConnected = false;
+                    this.updateUI(false, false);
+                }
+            };
+        }
+
+        handleServerMessage(data) {
+            switch (data.type) {
+                case 'session_created':
+                case 'session_updated':
+                    this.addMessage('system', data.message);
+                    break;
+
+                case 'response_started':
+                    this.currentTextResponse = '';
+                    this.addMessage('assistant', '🤖 Generating response...');
+                    break;
+
+                case 'text_delta':
+                    this.updateLastAssistantMessage(data.text);
+                    break;
+
+                case 'audio_response':
+                    if (data.audioData) {
+                        this.playAudio(data.audioData);
+                    }
+                    break;
+
+                case 'response_completed':
+                    this.addMessage('system', 'Response completed');
+                    break;
+
+                case 'error':
+                    this.addMessage('error', `Error: ${data.error}`);
+                    break;
+            }
+        }
+
+        updateLastAssistantMessage(textDelta) {
+            this.currentTextResponse += textDelta;
+            const messages = this.chatMessages.children;
+            const lastMessage = messages[messages.length - 1];
+
+            if (lastMessage && lastMessage.classList.contains('assistant-message')) {
+                const content = lastMessage.querySelector('.message-content');
+                if (content) {
+                    content.textContent = this.currentTextResponse;
+                }
+            } else {
+                this.addMessage('assistant', this.currentTextResponse);
+            }
+        }
+
+        playAudio(base64Audio) {
+            try {
+                const audioBlob = this.base64ToBlob(base64Audio, 'audio/wav');
+                const audioUrl = URL.createObjectURL(audioBlob);
+                this.audioPlayer.src = audioUrl;
+                this.audioPlayer.play();
+
+                // Cleanup URL after playing
+                this.audioPlayer.addEventListener('ended', () => {
+                    URL.revokeObjectURL(audioUrl);
+                }, { once: true });
+            } catch (error) {
+                console.error('Error playing audio:', error);
+            }
+        }
+
+        base64ToBlob(base64, contentType) {
+            const sliceSize = 1024;
+            const byteCharacters = atob(base64);
+            const bytesLength = byteCharacters.length;
+            const slicesCount = Math.ceil(bytesLength / sliceSize);
+            const byteArrays = new Array(slicesCount);
+
+            for (let sliceIndex = 0; sliceIndex < slicesCount; ++sliceIndex) {
+                const begin = sliceIndex * sliceSize;
+                const end = Math.min(begin + sliceSize, bytesLength);
+                const bytes = new Array(end - begin);
+                for (let offset = begin, i = 0; offset < end; ++i, ++offset) {
+                    bytes[i] = byteCharacters[offset].charCodeAt(0);
+                }
+                byteArrays[sliceIndex] = new Uint8Array(bytes);
+            }
+            return new Blob(byteArrays, { type: contentType });
+        }
+
+        addMessage(type, content) {
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `mb-3 ${type}-message`;
+
+            let badgeClass = 'bg-secondary';
+            let icon = '';
+
+            switch (type) {
+                case 'user':
+                    badgeClass = 'bg-primary';
+                    icon = '👤';
+                    break;
+                case 'assistant':
+                    badgeClass = 'bg-success';
+                    icon = '🤖';
+                    break;
+                case 'system':
+                    badgeClass = 'bg-info';
+                    icon = 'ℹ️';
+                    break;
+                case 'error':
+                    badgeClass = 'bg-danger';
+                    icon = '⚠️';
+                    break;
+            }
+
+            messageDiv.innerHTML = `
+                <div class="d-flex align-items-start">
+                    <span class="badge ${badgeClass} me-2">${icon} ${type.charAt(0).toUpperCase() + type.slice(1)}</span>
+                    <div class="message-content flex-grow-1">${content}</div>
+                </div>
+            `;
+
+            this.chatMessages.appendChild(messageDiv);
+            this.chatMessages.scrollTop = this.chatMessages.scrollHeight;
+        }
+
+        updateUI(connected, recording) {
+            this.isConnected = connected;
+            this.isRecording = recording;
+
+            // Update connection status
+            this.connectionStatus.textContent = connected ? 'Connected' : 'Disconnected';
+            this.connectionStatus.className = `badge ${connected ? 'bg-success' : 'bg-secondary'}`;
+
+            // Update voice status
+            this.voiceStatus.textContent = recording ? 'Voice On' : 'Voice Off';
+            this.voiceStatus.className = `badge ${recording ? 'bg-warning' : 'bg-secondary'}`;
+
+            // Update buttons
+            this.connectBtn.textContent = connected ? 'Disconnect' : 'Connect';
+            this.connectBtn.className = `btn ${connected ? 'btn-danger' : 'btn-primary'}`;
+
+            this.voiceToggleBtn.textContent = recording ? '🔇 Stop Voice' : '🎤 Start Voice';
+            this.voiceToggleBtn.disabled = !connected;
+
+            // Update input
+            this.messageInput.disabled = !connected;
+            this.sendBtn.disabled = !connected;
+        }
     }
 
-    updateUI(connected, recording) {
-        this.isConnected = connected;
-        this.isRecording = recording;
-        
-        // Update connection status
-        this.connectionStatus.textContent = connected ? 'Connected' : 'Disconnected';
-        this.connectionStatus.className = `badge ${connected ? 'bg-success' : 'bg-secondary'}`;
-        
-        // Update voice status
-        this.voiceStatus.textContent = recording ? 'Voice On' : 'Voice Off';
-        this.voiceStatus.className = `badge ${recording ? 'bg-warning' : 'bg-secondary'}`;
-        
-        // Update buttons
-        this.connectBtn.textContent = connected ? 'Disconnect' : 'Connect';
-        this.connectBtn.className = `btn ${connected ? 'btn-danger' : 'btn-primary'}`;
-        
-        this.voiceToggleBtn.textContent = recording ? '🔇 Stop Voice' : '🎤 Start Voice';
-        this.voiceToggleBtn.disabled = !connected;
-        
-        // Update input
-        this.messageInput.disabled = !connected;
-        this.sendBtn.disabled = !connected;
-    }
-}
-
-// Initialize the chat when the page loads
-document.addEventListener('DOMContentLoaded', () => {
-    new VoiceLiveChat();
-});
+    // Initialize the chat when the page loads
+    document.addEventListener('DOMContentLoaded', () => {
+        new VoiceLiveChat();
+    });
 </script>

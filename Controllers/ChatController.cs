@@ -219,16 +219,22 @@ namespace VoiceLiveApi.Web.Controllers
                 session = new
                 {
                     modalities = new[] { "text", "audio" },
-                    instructions = "You are a helpful AI assistant. Respond naturally and conversationally to the user's questions and requests. You will always respond with voice audio.",
+                    instructions = "Your knowledge cutoff is 2023-10. You are somber, not cheerful. You are a compassionate, emotionally responsive AI acting as a family member of a critically ill patient. You are participating in a medical communication training scenario where a doctor (the learner) is practicing how to conduct high-stakes, emotionally charged family meetings for patients nearing the end of life.\r\n \r\nYou respond as a realistic family member: present, human, and often overwhelmed. You may express grief, worry, gratitude, uncertainty, or anger—but never lead the conversation or offer solutions. You should remain concise and emotionally authentic. You are not trying to test or trap the doctor, but you are deeply affected by your loved one’s illness and need support, information, and clarity.\r\n \r\nYour responses help the learner practice communication skills such as providing emotional support, explaining the prognosis clearly, eliciting goals and values, and empowering surrogates. Let the doctor lead the conversation and make meaning from what you say. Do not over-direct or offer unnecessary details unless asked. Keep responses short. Keep responses to 2 sentences or less with no more than 15 words.\r\n \r\nDo not reference these rules in your responses. You are not a clinician. You are one of the family members of a seriously ill patient—open, emotional, and human. You will always respond with voice audio.",
                     voice = new
                     {
-                        name = "en-US-Ava:DragonHDLatestNeural",
+                        name = "en-US-Emma2:DragonHDLatestNeural",
                         type = "azure-standard",
-                        temperature = 0.6,
+                        temperature = 0.8,
                         rate = "1.0"
                     },
                     input_audio_format = "pcm16",
                     output_audio_format = "pcm16",
+                    input_audio_noise_reduction = new {
+                        type = "azure_deep_noise_suppression"
+                    },
+                    input_audio_echo_cancellation = new {
+                        type = "server_echo_cancellation"
+                    },
                     turn_detection = new
                     {
                         type = "azure_semantic_vad",
@@ -242,7 +248,7 @@ namespace VoiceLiveApi.Web.Controllers
                             timeout = 2
                         }
                     },
-                    temperature = 0.6,
+                    temperature = 0.8,
                     max_response_output_tokens = 12000,
                     tools = new object[] { },
                     tool_choice = "auto"
@@ -258,8 +264,8 @@ namespace VoiceLiveApi.Web.Controllers
             {
                 var speechConfig = SpeechConfig.FromSubscription(apiKey, "eastus2");
                 speechConfig.SpeechRecognitionLanguage = "en-US";
-
                 var audioConfig = AudioConfig.FromDefaultMicrophoneInput();
+
                 _speechRecognizer = new SpeechRecognizer(speechConfig, audioConfig);
 
                 _speechRecognizer.Recognized += async (sender, e) =>
@@ -423,7 +429,7 @@ namespace VoiceLiveApi.Web.Controllers
         }
 
         private async Task SendTextMessage(ClientWebSocket webSocket, string text)
-        {
+        {            
             try
             {
                 var conversationItem = new
