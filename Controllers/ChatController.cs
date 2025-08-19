@@ -3,6 +3,7 @@ using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
 using VoiceLiveApi.Web.Services;
+using VoiceLiveApi.Web.Models;
 
 namespace VoiceLiveApi.Web.Controllers
 {
@@ -13,32 +14,58 @@ namespace VoiceLiveApi.Web.Controllers
         private readonly IConfiguration _configuration;
         private readonly ILogger<ChatController> _logger;
         private readonly IConversationHistoryService _conversationHistoryService;
-        
-        // Single-user session state
-        private static ClientWebSocket? _currentWebSocket;
-        private static List<byte> _audioBuffer = new List<byte>();
-        private static bool _isRecording = false;
-        private static readonly object _lock = new object();
+        private readonly ISessionManager _sessionManager;
 
-        public ChatController(IConfiguration configuration, ILogger<ChatController> logger, IConversationHistoryService conversationHistoryService)
+        public ChatController(
+            IConfiguration configuration, 
+            ILogger<ChatController> logger, 
+            IConversationHistoryService conversationHistoryService,
+            ISessionManager sessionManager)
         {
             _configuration = configuration;
             _logger = logger;
             _conversationHistoryService = conversationHistoryService;
+            _sessionManager = sessionManager;
         }
 
-        [HttpPost("connect")]
-        public async Task<IActionResult> ConnectToVoiceLive()
+        [HttpPost("create-session")]
+        public IActionResult CreateSession()
         {
             try
             {
+                var sessionId = _sessionManager.CreateSession();
+                return Ok(new { sessionId = sessionId, message = "Session created successfully" });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error creating session");
+                return BadRequest(new { error = ex.Message });
+            }
+        }
+
+        [HttpPost("connect")]
+        public async Task<IActionResult> ConnectToVoiceLive([FromBody] ConnectRequest request)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(request.SessionId))
+                {
+                    return BadRequest(new { error = "SessionId is required" });
+                }
+
+                var session = _sessionManager.GetSession(request.SessionId);
+                if (session == null)
+                {
+                    return BadRequest(new { error = "Invalid session ID" });
+                }
+
                 var resourceName = _configuration["AzureAI:FoundryResourceName"] ?? throw new InvalidOperationException("AzureAI:FoundryResourceName not found");
                 var apiKey = _configuration["AzureAI:ApiKey"] ?? throw new InvalidOperationException("AzureAI:ApiKey not found");
                 var apiVersion = _configuration["AzureAI:ApiVersion"] ?? throw new InvalidOperationException("AzureAI:ApiVersion not found");
                 var modelName = _configuration["AzureAI:ModelName"] ?? throw new InvalidOperationException("AzureAI:ModelName not found");
 
                 // Disconnect existing connection if any
-                await DisconnectFromVoiceLive();
+                await DisconnectSession(session);
 
                 // Build WebSocket URI
                 var webSocketUri = new Uri($"wss://{resourceName}.cognitiveservices.azure.com/voice-live/realtime?api-version={apiVersion}&model={modelName}");
@@ -49,35 +76,47 @@ namespace VoiceLiveApi.Web.Controllers
 
                 await webSocket.ConnectAsync(webSocketUri, CancellationToken.None);
                 
-                lock (_lock)
+                lock (session.Lock)
                 {
-                    _currentWebSocket = webSocket;
-                    _conversationHistoryService.ClearHistory();
+                    session.WebSocket = webSocket;
+                    session.UpdateActivity();
+                    _conversationHistoryService.ClearHistory(session.SessionId);
                 }
 
                 // Configure the session
                 await ConfigureVoiceLiveSession(webSocket);
 
-                return Ok(new { message = "Connected to Voice Live API", status = "connected" });
+                return Ok(new { message = "Connected to Voice Live API", status = "connected", sessionId = session.SessionId });
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error connecting to Voice Live API");
+                _logger.LogError(ex, "Error connecting to Voice Live API for session {SessionId}", request.SessionId);
                 return BadRequest(new { error = ex.Message });
             }
         }
 
         [HttpPost("disconnect")]
-        public async Task<IActionResult> DisconnectFromVoiceLive()
+        public async Task<IActionResult> DisconnectFromVoiceLive([FromBody] SessionRequest request)
         {
             try
             {
-                await CleanupResources();
-                return Ok(new { message = "Disconnected from Voice Live API", status = "disconnected" });
+                if (string.IsNullOrEmpty(request.SessionId))
+                {
+                    return BadRequest(new { error = "SessionId is required" });
+                }
+
+                var session = _sessionManager.GetSession(request.SessionId);
+                if (session == null)
+                {
+                    return BadRequest(new { error = "Invalid session ID" });
+                }
+
+                await DisconnectSession(session);
+                return Ok(new { message = "Disconnected from Voice Live API", status = "disconnected", sessionId = session.SessionId });
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error disconnecting from Voice Live API");
+                _logger.LogError(ex, "Error disconnecting from Voice Live API for session {SessionId}", request.SessionId);
                 return BadRequest(new { error = ex.Message });
             }
         }
@@ -87,17 +126,23 @@ namespace VoiceLiveApi.Web.Controllers
         {
             try
             {
-                if (_currentWebSocket?.State != WebSocketState.Open)
+                if (string.IsNullOrEmpty(request.SessionId))
                 {
-                    return BadRequest(new { error = "Not connected to Voice Live API" });
+                    return BadRequest(new { error = "SessionId is required" });
                 }
 
-                await SendTextMessage(_currentWebSocket, request.Message);
-                return Ok(new { message = "Message sent", text = request.Message });
+                var session = _sessionManager.GetSession(request.SessionId);
+                if (session?.WebSocket?.State != WebSocketState.Open)
+                {
+                    return BadRequest(new { error = "Session not connected to Voice Live API" });
+                }
+
+                await SendTextMessage(session.WebSocket, request.Message, session.SessionId);
+                return Ok(new { message = "Message sent", text = request.Message, sessionId = session.SessionId });
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error sending message");
+                _logger.LogError(ex, "Error sending message for session {SessionId}", request.SessionId);
                 return BadRequest(new { error = ex.Message });
             }
         }
@@ -107,9 +152,15 @@ namespace VoiceLiveApi.Web.Controllers
         {
             try
             {
-                if (_currentWebSocket?.State != WebSocketState.Open)
+                if (string.IsNullOrEmpty(request.SessionId))
                 {
-                    return BadRequest(new { error = "Not connected to Voice Live API" });
+                    return BadRequest(new { error = "SessionId is required" });
+                }
+
+                var session = _sessionManager.GetSession(request.SessionId);
+                if (session?.WebSocket?.State != WebSocketState.Open)
+                {
+                    return BadRequest(new { error = "Session not connected to Voice Live API" });
                 }
 
                 if (string.IsNullOrEmpty(request.AudioData))
@@ -117,72 +168,104 @@ namespace VoiceLiveApi.Web.Controllers
                     return BadRequest(new { error = "No audio data provided" });
                 }
 
-                await SendAudioToVoiceLive(_currentWebSocket, request.AudioData);
-                return Ok(new { message = "Audio data sent" });
+                await SendAudioToVoiceLive(session.WebSocket, request.AudioData);
+                return Ok(new { message = "Audio data sent", sessionId = session.SessionId });
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error sending audio data");
+                _logger.LogError(ex, "Error sending audio data for session {SessionId}", request.SessionId);
                 return BadRequest(new { error = ex.Message });
             }
         }
 
         [HttpPost("toggle-voice")]
-        public async Task<IActionResult> ToggleVoiceRecording()
+        public async Task<IActionResult> ToggleVoiceRecording([FromBody] SessionRequest request)
         {
             try
             {
-                if (_currentWebSocket?.State != WebSocketState.Open)
+                if (string.IsNullOrEmpty(request.SessionId))
                 {
-                    return BadRequest(new { error = "Not connected to Voice Live API" });
+                    return BadRequest(new { error = "SessionId is required" });
                 }
 
-                lock (_lock)
+                var session = _sessionManager.GetSession(request.SessionId);
+                if (session?.WebSocket?.State != WebSocketState.Open)
                 {
-                    _isRecording = !_isRecording;
+                    return BadRequest(new { error = "Session not connected to Voice Live API" });
                 }
 
-                if (_isRecording)
+                lock (session.Lock)
+                {
+                    session.IsRecording = !session.IsRecording;
+                    session.UpdateActivity();
+                }
+
+                if (session.IsRecording)
                 {
                     // Clear any existing audio buffer when starting
-                    await ClearAudioBuffer();
-                    return Ok(new { message = "Voice recording started", isRecording = true });
+                    await ClearAudioBuffer(session.WebSocket);
+                    return Ok(new { message = "Voice recording started", isRecording = true, sessionId = session.SessionId });
                 }
                 else
                 {
                     // Commit any pending audio when stopping
-                    await CommitAudioBuffer();
-                    return Ok(new { message = "Voice recording stopped", isRecording = false });
+                    await CommitAudioBuffer(session.WebSocket);
+                    return Ok(new { message = "Voice recording stopped", isRecording = false, sessionId = session.SessionId });
                 }
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error toggling voice recording");
-                lock (_lock)
+                _logger.LogError(ex, "Error toggling voice recording for session {SessionId}", request.SessionId);
+                
+                var session = _sessionManager.GetSession(request.SessionId);
+                if (session != null)
                 {
-                    _isRecording = false;
+                    lock (session.Lock)
+                    {
+                        session.IsRecording = false;
+                    }
                 }
                 return BadRequest(new { error = ex.Message });
             }
         }
 
         [HttpGet("status")]
-        public IActionResult GetStatus()
+        public IActionResult GetStatus([FromQuery] string sessionId)
         {
-            var isConnected = _currentWebSocket?.State == WebSocketState.Open;
+            if (string.IsNullOrEmpty(sessionId))
+            {
+                return BadRequest(new { error = "SessionId is required" });
+            }
+
+            var session = _sessionManager.GetSession(sessionId);
+            if (session == null)
+            {
+                return BadRequest(new { error = "Invalid session ID" });
+            }
+
+            var isConnected = session.WebSocket?.State == WebSocketState.Open;
             return Ok(new { 
                 isConnected = isConnected,
-                isRecording = _isRecording
+                isRecording = session.IsRecording,
+                sessionId = session.SessionId
             });
         }
 
         [HttpGet("stream")]
-        public async Task StreamMessages()
+        public async Task StreamMessages([FromQuery] string sessionId)
         {
-            if (_currentWebSocket?.State != WebSocketState.Open)
+            if (string.IsNullOrEmpty(sessionId))
             {
                 Response.StatusCode = 400;
-                await Response.WriteAsync("Not connected to Voice Live API");
+                await Response.WriteAsync("SessionId is required");
+                return;
+            }
+
+            var session = _sessionManager.GetSession(sessionId);
+            if (session?.WebSocket?.State != WebSocketState.Open)
+            {
+                Response.StatusCode = 400;
+                await Response.WriteAsync("Session not connected to Voice Live API");
                 return;
             }
 
@@ -193,7 +276,7 @@ namespace VoiceLiveApi.Web.Controllers
             try
             {
                 var buffer = new byte[8192];
-                while (_currentWebSocket.State == WebSocketState.Open && !HttpContext.RequestAborted.IsCancellationRequested)
+                while (session.WebSocket.State == WebSocketState.Open && !HttpContext.RequestAborted.IsCancellationRequested)
                 {
                     try
                     {
@@ -201,7 +284,7 @@ namespace VoiceLiveApi.Web.Controllers
                         var wholeMessage = new StringBuilder();
                         do
                         {
-                            result = await _currentWebSocket.ReceiveAsync(
+                            result = await session.WebSocket.ReceiveAsync(
                                 new ArraySegment<byte>(buffer),
                                 HttpContext.RequestAborted);
 
@@ -212,7 +295,7 @@ namespace VoiceLiveApi.Web.Controllers
 
                         if (result.MessageType == WebSocketMessageType.Text)
                         {
-                            var messageData = await ProcessVoiceLiveMessage(wholeMessage.ToString());
+                            var messageData = await ProcessVoiceLiveMessage(wholeMessage.ToString(), session);
                             if (messageData != null)
                             {
                                 await Response.WriteAsync($"data: {JsonSerializer.Serialize(messageData)}\n\n");
@@ -230,17 +313,162 @@ namespace VoiceLiveApi.Web.Controllers
                     }
                     catch (Exception ex)
                     {
-                        _logger.LogError(ex, "Error in message stream");
+                        _logger.LogError(ex, "Error in message stream for session {SessionId}", sessionId);
                         break;
                     }
                 }
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error in streaming endpoint");
+                _logger.LogError(ex, "Error in streaming endpoint for session {SessionId}", sessionId);
             }
         }
 
+        [HttpGet("history")]
+        public IActionResult GetConversationHistory([FromQuery] string sessionId)
+        {
+            if (string.IsNullOrEmpty(sessionId))
+            {
+                return BadRequest(new { error = "SessionId is required" });
+            }
+
+            var session = _sessionManager.GetSession(sessionId);
+            if (session == null)
+            {
+                return BadRequest(new { error = "Invalid session ID" });
+            }
+
+            var history = _conversationHistoryService.GetHistory(sessionId).Skip(1).ToList();
+            return Ok(new { conversationHistory = history, messageCount = history.Count, sessionId = sessionId });
+        }
+
+        [HttpPost("clear-history")]
+        public IActionResult ClearConversationHistory([FromBody] SessionRequest request)
+        {
+            if (string.IsNullOrEmpty(request.SessionId))
+            {
+                return BadRequest(new { error = "SessionId is required" });
+            }
+
+            var session = _sessionManager.GetSession(request.SessionId);
+            if (session == null)
+            {
+                return BadRequest(new { error = "Invalid session ID" });
+            }
+
+            _conversationHistoryService.ClearHistory(request.SessionId);
+            return Ok(new { message = "Conversation history cleared", sessionId = request.SessionId });
+        }
+
+        [HttpGet("last-recognized-speech")]
+        public IActionResult GetLastRecognizedSpeech([FromQuery] string sessionId)
+        {
+            if (string.IsNullOrEmpty(sessionId))
+            {
+                return BadRequest(new { error = "SessionId is required" });
+            }
+
+            var session = _sessionManager.GetSession(sessionId);
+            if (session == null)
+            {
+                return BadRequest(new { error = "Invalid session ID" });
+            }
+
+            var history = _conversationHistoryService.GetHistory(sessionId);
+            var lastUserMessage = history.LastOrDefault(h => h.StartsWith("LEARNER:"));
+            
+            if (!string.IsNullOrEmpty(lastUserMessage))
+            {
+                var speechText = lastUserMessage.Substring("LEARNER:".Length).Trim();
+                return Ok(new { recognizedText = speechText, sessionId = sessionId });
+            }
+            
+            return Ok(new { recognizedText = "", sessionId = sessionId });
+        }
+
+        [HttpDelete("session/{sessionId}")]
+        public IActionResult RemoveSession(string sessionId)
+        {
+            if (string.IsNullOrEmpty(sessionId))
+            {
+                return BadRequest(new { error = "SessionId is required" });
+            }
+
+            var removed = _sessionManager.RemoveSession(sessionId);
+            if (removed)
+            {
+                _conversationHistoryService.RemoveSession(sessionId);
+                return Ok(new { message = "Session removed successfully", sessionId = sessionId });
+            }
+            
+            return NotFound(new { error = "Session not found", sessionId = sessionId });
+        }
+
+        [HttpGet("sessions")]
+        public IActionResult GetActiveSessions()
+        {
+            var sessions = _sessionManager.GetActiveSessions();
+            var sessionCount = _sessionManager.GetActiveSessionCount();
+            return Ok(new { activeSessions = sessions, count = sessionCount });
+        }
+
+        [HttpGet("admin/sessions")]
+        public IActionResult GetSessionsAdmin()
+        {
+            var sessions = _sessionManager.GetActiveSessions();
+            var sessionCount = _sessionManager.GetActiveSessionCount();
+            var historyCount = _conversationHistoryService.GetActiveSessionCount();
+            
+            return Ok(new { 
+                activeSessions = sessions, 
+                sessionCount = sessionCount,
+                historySessionCount = historyCount,
+                message = $"Found {sessionCount} active sessions"
+            });
+        }
+
+        [HttpPost("admin/cleanup")]
+        public IActionResult CleanupExpiredSessions()
+        {
+            try
+            {
+                _sessionManager.CleanupExpiredSessions();
+                return Ok(new { message = "Expired sessions cleaned up successfully" });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error during manual session cleanup");
+                return BadRequest(new { error = ex.Message });
+            }
+        }
+
+        [HttpDelete("admin/session/{sessionId}")]
+        public IActionResult ForceRemoveSession(string sessionId)
+        {
+            if (string.IsNullOrEmpty(sessionId))
+            {
+                return BadRequest(new { error = "SessionId is required" });
+            }
+
+            try
+            {
+                var removed = _sessionManager.RemoveSession(sessionId);
+                if (removed)
+                {
+                    _conversationHistoryService.RemoveSession(sessionId);
+                    return Ok(new { message = "Session forcefully removed", sessionId = sessionId });
+                }
+                
+                return NotFound(new { error = "Session not found", sessionId = sessionId });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error force removing session {SessionId}", sessionId);
+                return BadRequest(new { error = ex.Message });
+            }
+        }
+
+        // Private helper methods (updated to work with sessions)
         private async Task ConfigureVoiceLiveSession(ClientWebSocket webSocket)
         {
             var sessionConfig = new
@@ -259,7 +487,6 @@ namespace VoiceLiveApi.Web.Controllers
                     },
                     input_audio_format = "pcm16",
                     output_audio_format = "pcm16",
-                    // Enable input audio transcription
                     input_audio_transcription = new
                     {
                         model = "azure-speech"
@@ -311,18 +538,18 @@ namespace VoiceLiveApi.Web.Controllers
             }
         }
 
-        private async Task ClearAudioBuffer()
+        private async Task ClearAudioBuffer(ClientWebSocket webSocket)
         {
             try
             {
-                if (_currentWebSocket?.State == WebSocketState.Open)
+                if (webSocket?.State == WebSocketState.Open)
                 {
                     var clearMessage = new
                     {
                         type = "input_audio_buffer.clear"
                     };
 
-                    await SendWebSocketMessage(_currentWebSocket, clearMessage);
+                    await SendWebSocketMessage(webSocket, clearMessage);
                 }
             }
             catch (Exception ex)
@@ -331,20 +558,19 @@ namespace VoiceLiveApi.Web.Controllers
             }
         }
 
-        private async Task CommitAudioBuffer()
+        private async Task CommitAudioBuffer(ClientWebSocket webSocket)
         {
             try
             {
-                if (_currentWebSocket?.State == WebSocketState.Open)
+                if (webSocket?.State == WebSocketState.Open)
                 {
                     var commitMessage = new
                     {
                         type = "input_audio_buffer.commit"
                     };
 
-                    await SendWebSocketMessage(_currentWebSocket, commitMessage);
+                    await SendWebSocketMessage(webSocket, commitMessage);
 
-                    // Request response after committing audio
                     var responseCreate = new
                     {
                         type = "response.create",
@@ -355,7 +581,7 @@ namespace VoiceLiveApi.Web.Controllers
                         }
                     };
 
-                    await SendWebSocketMessage(_currentWebSocket, responseCreate);
+                    await SendWebSocketMessage(webSocket, responseCreate);
                 }
             }
             catch (Exception ex)
@@ -364,7 +590,7 @@ namespace VoiceLiveApi.Web.Controllers
             }
         }
 
-        private async Task<object?> ProcessVoiceLiveMessage(string message)
+        private async Task<object?> ProcessVoiceLiveMessage(string message, ChatSession session)
         {
             try
             {
@@ -374,56 +600,57 @@ namespace VoiceLiveApi.Web.Controllers
                 switch (messageType)
                 {
                     case "session.created":
-                        return new { type = "session_created", message = "Voice Live session created" };
+                        return new { type = "session_created", message = "Voice Live session created", sessionId = session.SessionId };
 
                     case "session.updated":
-                        return new { type = "session_updated", message = "Voice Live session updated - Ready for conversation!" };
+                        return new { type = "session_updated", message = "Voice Live session updated - Ready for conversation!", sessionId = session.SessionId };
 
                     case "input_audio_buffer.speech_started":
-                        return new { type = "speech_started", message = "Speech detected in audio buffer" };
+                        return new { type = "speech_started", message = "Speech detected in audio buffer", sessionId = session.SessionId };
 
                     case "input_audio_buffer.speech_stopped":
-                        return new { type = "speech_stopped", message = "Speech ended in audio buffer" };
+                        return new { type = "speech_stopped", message = "Speech ended in audio buffer", sessionId = session.SessionId };
 
                     case "input_audio_buffer.committed":
-                        return new { type = "audio_committed", message = "Audio buffer committed for processing" };
+                        return new { type = "audio_committed", message = "Audio buffer committed for processing", sessionId = session.SessionId };
 
                     case "conversation.item.created":
-                        return await HandleConversationItemCreated(doc.RootElement);
+                        return await HandleConversationItemCreated(doc.RootElement, session);
 
                     case "conversation.item.input_audio_transcription.completed":
-                        //var input = doc.RootElement.GetProperty("transcript");
-                        //_conversationHistoryService.AddMessage($"LEARNER: {input}");
-                        return await HandleAudioTranscriptionCompleted(doc.RootElement);
+                        return await HandleAudioTranscriptionCompleted(doc.RootElement, session);
 
                     case "response.created":
-                        _audioBuffer.Clear();
-                        return new { type = "response_started", message = "AI is generating response..." };
+                        lock (session.Lock)
+                        {
+                            session.AudioBuffer.Clear();
+                        }
+                        return new { type = "response_started", message = "AI is generating response...", sessionId = session.SessionId };
 
                     case "response.audio.delta":
-                        await HandleAudioDelta(doc.RootElement);
+                        await HandleAudioDelta(doc.RootElement, session);
                         return null;
 
                     case "response.audio.done":
-                        var audioData = await ProcessAggregatedAudio();
-                        return new { type = "audio_response", audioData = audioData, message = "Audio response completed" };
+                        var audioData = await ProcessAggregatedAudio(session);
+                        return new { type = "audio_response", audioData = audioData, message = "Audio response completed", sessionId = session.SessionId };
 
                     case "response.text.delta":
                         var textDelta = GetTextDelta(doc.RootElement);
                         if (!string.IsNullOrEmpty(textDelta))
                         {
-                            return new { type = "text_delta", text = textDelta };
+                            return new { type = "text_delta", text = textDelta, sessionId = session.SessionId };
                         }
                         return null;
 
                     case "response.done":
                         var response = doc.RootElement.GetProperty("response").GetProperty("output")[0].GetProperty("content")[0].GetProperty("transcript");
-                        _conversationHistoryService.AddMessage($"FAMILY: {response}");
-                        return new { type = "response_completed", message = "Response completed" };
+                        _conversationHistoryService.AddMessage(session.SessionId, $"FAMILY: {response}");
+                        return new { type = "response_completed", message = "Response completed", sessionId = session.SessionId };
 
                     case "error":
                         var error = doc.RootElement.GetProperty("error");
-                        return new { type = "error", error = error.ToString() };
+                        return new { type = "error", error = error.ToString(), sessionId = session.SessionId };
 
                     default:
                         return null;
@@ -431,12 +658,12 @@ namespace VoiceLiveApi.Web.Controllers
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error processing Voice Live message");
-                return new { type = "error", error = ex.Message };
+                _logger.LogError(ex, "Error processing Voice Live message for session {SessionId}", session.SessionId);
+                return new { type = "error", error = ex.Message, sessionId = session.SessionId };
             }
         }
 
-        private async Task<object?> HandleConversationItemCreated(JsonElement messageElement)
+        private async Task<object?> HandleConversationItemCreated(JsonElement messageElement, ChatSession session)
         {
             try
             {
@@ -447,19 +674,19 @@ namespace VoiceLiveApi.Web.Controllers
                     
                     if (itemType == "message" && role == "user")
                     {
-                        return new { type = "user_message_created", message = "User message added to conversation" };
+                        return new { type = "user_message_created", message = "User message added to conversation", sessionId = session.SessionId };
                     }
                 }
                 return null;
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error handling conversation item created");
+                _logger.LogError(ex, "Error handling conversation item created for session {SessionId}", session.SessionId);
                 return null;
             }
         }
 
-        private async Task<object?> HandleAudioTranscriptionCompleted(JsonElement messageElement)
+        private async Task<object?> HandleAudioTranscriptionCompleted(JsonElement messageElement, ChatSession session)
         {
             try
             {
@@ -468,13 +695,13 @@ namespace VoiceLiveApi.Web.Controllers
                     var transcribedText = transcriptElement.GetString();
                     if (!string.IsNullOrEmpty(transcribedText))
                     {
-                        // Add the transcribed text to conversation history
-                        _conversationHistoryService.AddMessage($"LEARNER: {transcribedText}");
+                        _conversationHistoryService.AddMessage(session.SessionId, $"LEARNER: {transcribedText}");
                         
                         return new { 
                             type = "user_speech_transcribed", 
                             text = transcribedText,
-                            message = "Speech recognized and transcribed"
+                            message = "Speech recognized and transcribed",
+                            sessionId = session.SessionId
                         };
                     }
                 }
@@ -482,12 +709,12 @@ namespace VoiceLiveApi.Web.Controllers
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error handling audio transcription completed");
+                _logger.LogError(ex, "Error handling audio transcription completed for session {SessionId}", session.SessionId);
                 return null;
             }
         }
 
-        private async Task HandleAudioDelta(JsonElement messageElement)
+        private async Task HandleAudioDelta(JsonElement messageElement, ChatSession session)
         {
             try
             {
@@ -497,13 +724,16 @@ namespace VoiceLiveApi.Web.Controllers
                     if (!string.IsNullOrEmpty(base64Audio))
                     {
                         var audioBytes = Convert.FromBase64String(base64Audio);
-                        _audioBuffer.AddRange(audioBytes);
+                        lock (session.Lock)
+                        {
+                            session.AudioBuffer.AddRange(audioBytes);
+                        }
                     }
                 }
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error handling audio delta");
+                _logger.LogError(ex, "Error handling audio delta for session {SessionId}", session.SessionId);
             }
         }
 
@@ -524,18 +754,23 @@ namespace VoiceLiveApi.Web.Controllers
             return null;
         }
 
-        private async Task<string?> ProcessAggregatedAudio()
+        private async Task<string?> ProcessAggregatedAudio(ChatSession session)
         {
             try
             {
-                if (_audioBuffer.Count == 0) return null;
+                List<byte> audioBufferCopy;
+                lock (session.Lock)
+                {
+                    if (session.AudioBuffer.Count == 0) return null;
+                    audioBufferCopy = new List<byte>(session.AudioBuffer);
+                }
 
-                var wavData = CreateWavFile(_audioBuffer.ToArray(), 24000, 1, 16);
+                var wavData = CreateWavFile(audioBufferCopy.ToArray(), 24000, 1, 16);
                 return Convert.ToBase64String(wavData);
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error processing aggregated audio");
+                _logger.LogError(ex, "Error processing aggregated audio for session {SessionId}", session.SessionId);
                 return null;
             }
         }
@@ -568,7 +803,7 @@ namespace VoiceLiveApi.Web.Controllers
             return memoryStream.ToArray();
         }
 
-        private async Task SendTextMessage(ClientWebSocket webSocket, string text)
+        private async Task SendTextMessage(ClientWebSocket webSocket, string text, string sessionId)
         {            
             try
             {
@@ -592,7 +827,7 @@ namespace VoiceLiveApi.Web.Controllers
 
                 await SendWebSocketMessage(webSocket, conversationItem);
 
-                _conversationHistoryService.AddMessage($"LEARNER: {text}");
+                _conversationHistoryService.AddMessage(sessionId, $"LEARNER: {text}");
 
                 var responseCreate = new
                 {
@@ -608,7 +843,7 @@ namespace VoiceLiveApi.Web.Controllers
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error sending text message");
+                _logger.LogError(ex, "Error sending text message for session {SessionId}", sessionId);
             }
         }
 
@@ -624,63 +859,50 @@ namespace VoiceLiveApi.Web.Controllers
                 CancellationToken.None);
         }
 
-        private async Task CleanupResources()
+        private async Task DisconnectSession(ChatSession session)
         {
-            lock (_lock)
+            lock (session.Lock)
             {
-                _isRecording = false;
+                session.IsRecording = false;
             }
 
-            if (_currentWebSocket != null)
+            if (session.WebSocket != null)
             {
-                if (_currentWebSocket.State == WebSocketState.Open)
+                if (session.WebSocket.State == WebSocketState.Open)
                 {
-                    await _currentWebSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Session ended", CancellationToken.None);                    
+                    await session.WebSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Session ended", CancellationToken.None);                    
                 }
-                _currentWebSocket.Dispose();
-                _currentWebSocket = null;
+                session.WebSocket.Dispose();
+                session.WebSocket = null;
             }
 
-            _audioBuffer.Clear();
-        }
-
-        [HttpGet("history")]
-        public IActionResult GetConversationHistory()
-        {
-            var history = _conversationHistoryService.GetHistory().Skip(1).ToList();
-            return Ok(new { conversationHistory = history, messageCount = history.Count });
-        }
-
-        [HttpPost("clear-history")]
-        public IActionResult ClearConversationHistory()
-        {
-            _conversationHistoryService.ClearHistory();
-            return Ok(new { message = "Conversation history cleared" });
-        }
-
-        [HttpGet("last-recognized-speech")]
-        public IActionResult GetLastRecognizedSpeech()
-        {
-            var history = _conversationHistoryService.GetHistory();
-            var lastUserMessage = history.LastOrDefault(h => h.StartsWith("LEARNER:"));
-            
-            if (!string.IsNullOrEmpty(lastUserMessage))
+            lock (session.Lock)
             {
-                var speechText = lastUserMessage.Substring("LEARNER:".Length).Trim();
-                return Ok(new { recognizedText = speechText });
+                session.AudioBuffer.Clear();
             }
-            
-            return Ok(new { recognizedText = "" });
         }
+    }
+
+    // Updated request classes
+    public class ConnectRequest
+    {
+        public string SessionId { get; set; } = string.Empty;
+    }
+
+    public class SessionRequest
+    {
+        public string SessionId { get; set; } = string.Empty;
     }
 
     public class SendMessageRequest
     {
+        public string SessionId { get; set; } = string.Empty;
         public string Message { get; set; } = string.Empty;
     }
 
     public class SendAudioRequest
     {
+        public string SessionId { get; set; } = string.Empty;
         public string AudioData { get; set; } = string.Empty;
     }
 }

@@ -1,34 +1,55 @@
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 
 namespace VoiceLiveApi.Web.Services
 {
     public class ConversationHistoryService : IConversationHistoryService
     {
-        private readonly IList<string> _conversationHistory = new List<string>();
+        private readonly ConcurrentDictionary<string, List<string>> _sessionHistories = new();
         private readonly object _lock = new object();
 
-        public void AddMessage(string message)
+        public void AddMessage(string sessionId, string message)
         {
+            var history = _sessionHistories.GetOrAdd(sessionId, _ => new List<string>());
+
             lock (_lock)
             {
-                _conversationHistory.Add(message);
+                history.Add(message);
             }
         }
 
-        public void ClearHistory()
+        public void ClearHistory(string sessionId)
         {
-            lock (_lock)
+            if (_sessionHistories.TryGetValue(sessionId, out var history))
             {
-                _conversationHistory.Clear();
+                lock (_lock)
+                {
+                    history.Clear();
+                }
             }
         }
 
-        public IList<string> GetHistory()
+        public IList<string> GetHistory(string sessionId)
         {
-            lock (_lock)
+            if (_sessionHistories.TryGetValue(sessionId, out var history))
             {
-                return _conversationHistory.AsReadOnly();
+                lock (_lock)
+                {
+                    return history.AsReadOnly();
+                }
             }
+
+            return new List<string>().AsReadOnly();
+        }
+
+        public void RemoveSession(string sessionId)
+        {
+            _sessionHistories.TryRemove(sessionId, out _);
+        }
+
+        public int GetActiveSessionCount()
+        {
+            return _sessionHistories.Count;
         }
     }
 }

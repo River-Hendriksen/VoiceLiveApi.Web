@@ -12,6 +12,21 @@
                 <p class="lead">Chat with AI using text or voice input</p>
             </div>
 
+            <!-- Session Info -->
+            <div class="card mb-3">
+                <div class="card-body">
+                    <div class="d-flex justify-content-between align-items-center">
+                        <div>
+                            <small class="text-muted">Session ID: <span id="sessionId">None</span></small>
+                        </div>
+                        <div>
+                            <button type="button" class="btn btn-sm btn-outline-primary" id="newSessionBtn">New Session</button>
+                            <a href="/Admin" class="btn btn-sm btn-outline-secondary">🔧 Admin</a>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
             <!-- Connection Status -->
             <div class="card mb-3">
                 <div class="card-body">
@@ -22,7 +37,7 @@
                             <span class="badge bg-secondary" id="audioStatus">Audio Ready</span>
                         </div>
                         <div>
-                            <button type="button" class="btn btn-primary" id="connectBtn">Connect</button>
+                            <button type="button" class="btn btn-primary" id="connectBtn" disabled>Connect</button>
                             <button type="button" class="btn btn-secondary" id="voiceToggleBtn" disabled>🎤 Start Voice</button>
                             <button type="button" class="btn btn-outline-info" id="downloadBtn" disabled>📥 Download History</button>
                         </div>
@@ -50,7 +65,7 @@
                 </div>
                 <div class="card-body" style="overflow-y: auto;" id="chatMessages">
                     <div class="text-muted text-center">
-                        <p>Connect to start chatting...</p>
+                        <p>Create a session and connect to start chatting...</p>
                     </div>
                 </div>
             </div>
@@ -74,20 +89,16 @@
 <script>
     class VoiceLiveChat {
         constructor() {
+            this.sessionId = null;
             this.isConnected = false;
             this.isRecording = false;
             this.eventSource = null;
             this.currentTextResponse = '';
-            this.mediaStream = null;
-            this.audioContext = null;
-            this.audioProcessor = null;
-            this.analyser = null;
-            this.audioLevelInterval = null;
 
             this.initializeElements();
             this.bindEvents();
-            this.checkStatus();
             this.initializeAudio();
+            this.checkStatus();
         }
 
         async initializeAudio() {
@@ -108,20 +119,24 @@
                 };
 
                 // Request microphone access
-                this.mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
+                const mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
                 
                 // Create audio context for processing
-                this.audioContext = new (window.AudioContext || window.webkitAudioContext)({
+                const audioContext = new (window.AudioContext || window.webkitAudioContext)({
                     sampleRate: 24000 // Match Voice Live API requirements
                 });
 
                 // Create analyser for audio level monitoring
-                this.analyser = this.audioContext.createAnalyser();
-                this.analyser.fftSize = 256;
+                const analyser = audioContext.createAnalyser();
+                analyser.fftSize = 256;
 
                 // Connect media stream to analyser
-                const source = this.audioContext.createMediaStreamSource(this.mediaStream);
-                source.connect(this.analyser);
+                const source = audioContext.createMediaStreamSource(mediaStream);
+                source.connect(analyser);
+
+                this.audioContext = audioContext;
+                this.analyser = analyser;
+                this.mediaStream = mediaStream;
 
                 this.updateAudioStatus('Audio Ready', 'bg-success');
                 this.addMessage('system', 'Microphone access granted and audio system initialized');
@@ -133,6 +148,8 @@
         }
 
         initializeElements() {
+            this.newSessionBtn = document.getElementById('newSessionBtn');
+            this.sessionIdDisplay = document.getElementById('sessionId');
             this.connectBtn = document.getElementById('connectBtn');
             this.voiceToggleBtn = document.getElementById('voiceToggleBtn');
             this.messageInput = document.getElementById('messageInput');
@@ -149,6 +166,7 @@
         }
 
         bindEvents() {
+            this.newSessionBtn.addEventListener('click', () => this.createNewSession());
             this.connectBtn.addEventListener('click', () => this.toggleConnection());
             this.voiceToggleBtn.addEventListener('click', () => this.toggleVoice());
             this.sendBtn.addEventListener('click', () => this.sendMessage());
@@ -158,11 +176,34 @@
             });
         }
 
-        async checkStatus() {
+        async createNewSession() {
             try {
-                const response = await fetch('/api/chat/status');
+                this.addMessage('system', 'Creating new session...');
+                const response = await fetch('/api/chat/create-session', { method: 'POST' });
+                const result = await response.json();
+
+                if (response.ok) {
+                    this.sessionId = result.sessionId;
+                    this.sessionIdDisplay.textContent = this.sessionId;
+                    this.addMessage('system', `Session created: ${this.sessionId}`);
+                    this.updateUI(false, false); // Enable connect button
+                } else {
+                    this.addMessage('error', `Session creation failed: ${result.error}`);
+                }
+            } catch (error) {
+                this.addMessage('error', `Session creation error: ${error.message}`);
+            }
+        }
+
+        async checkStatus() {
+            if (!this.sessionId) return;
+            
+            try {
+                const response = await fetch(`/api/chat/status?sessionId=${this.sessionId}`);
                 const status = await response.json();
-                this.updateUI(status.isConnected, status.isRecording);
+                if (response.ok) {
+                    this.updateUI(status.isConnected, status.isRecording);
+                }
             } catch (error) {
                 console.error('Error checking status:', error);
             }
@@ -177,9 +218,18 @@
         }
 
         async connect() {
+            if (!this.sessionId) {
+                this.addMessage('error', 'Please create a session first');
+                return;
+            }
+
             try {
                 this.addMessage('system', 'Connecting to Voice Live API...');
-                const response = await fetch('/api/chat/connect', { method: 'POST' });
+                const response = await fetch('/api/chat/connect', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ sessionId: this.sessionId })
+                });
                 const result = await response.json();
 
                 if (response.ok) {
@@ -197,8 +247,9 @@
         }
 
         async disconnect() {
+            if (!this.sessionId) return;
+
             try {
-                // Stop recording if active
                 if (this.isRecording) {
                     await this.stopVoiceRecording();
                 }
@@ -208,7 +259,11 @@
                     this.eventSource = null;
                 }
 
-                const response = await fetch('/api/chat/disconnect', { method: 'POST' });
+                const response = await fetch('/api/chat/disconnect', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ sessionId: this.sessionId })
+                });
                 const result = await response.json();
 
                 this.isConnected = false;
@@ -229,6 +284,8 @@
         }
 
         async startVoiceRecording() {
+            if (!this.sessionId) return;
+
             try {
                 if (!this.audioContext || !this.mediaStream) {
                     throw new Error('Audio system not initialized');
@@ -247,7 +304,11 @@
                 this.startAudioLevelMonitoring();
 
                 // Start recording on server
-                const response = await fetch('/api/chat/toggle-voice', { method: 'POST' });
+                const response = await fetch('/api/chat/toggle-voice', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ sessionId: this.sessionId })
+                });
                 const result = await response.json();
 
                 if (response.ok && result.isRecording) {
@@ -264,6 +325,8 @@
         }
 
         async stopVoiceRecording() {
+            if (!this.sessionId) return;
+
             try {
                 // Stop audio processor
                 if (this.audioProcessor) {
@@ -276,7 +339,11 @@
                 this.stopAudioLevelMonitoring();
 
                 // Stop recording on server
-                const response = await fetch('/api/chat/toggle-voice', { method: 'POST' });
+                const response = await fetch('/api/chat/toggle-voice', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ sessionId: this.sessionId })
+                });
                 const result = await response.json();
 
                 if (response.ok) {
@@ -327,13 +394,13 @@
         }
 
         async sendAudioData(base64Audio) {
-            try {
-                if (!this.isConnected || !this.isRecording) return;
+            if (!this.sessionId || !this.isConnected || !this.isRecording) return;
 
+            try {
                 await fetch('/api/chat/send-audio', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ audioData: base64Audio })
+                    body: JSON.stringify({ sessionId: this.sessionId, audioData: base64Audio })
                 });
             } catch (error) {
                 console.error('Error sending audio data:', error);
@@ -381,8 +448,10 @@
         }
 
         async downloadConversationHistory() {
+            if (!this.sessionId) return;
+
             try {
-                const response = await fetch('/api/chat/history');
+                const response = await fetch(`/api/chat/history?sessionId=${this.sessionId}`);
                 const result = await response.json();
 
                 if (response.ok && result.conversationHistory && result.conversationHistory.length > 0) {
@@ -411,7 +480,7 @@
         }
 
         formatHistoryForDownload(history, timestamp) {
-            const header = `Voice Live Chat Conversation History\nExported: ${new Date().toLocaleString()}\n${'='.repeat(50)}\n\n`;
+            const header = `Voice Live Chat Conversation History\nSession: ${this.sessionId}\nExported: ${new Date().toLocaleString()}\n${'='.repeat(50)}\n\n`;
             const messages = history.map((message, index) => `${index + 1}. ${message}`).join('\n');
             const footer = `\n\n${'='.repeat(50)}\nEnd of conversation (${history.length} messages)`;
             
@@ -419,6 +488,8 @@
         }
 
         async sendMessage(messageOverride = null) {
+            if (!this.sessionId) return;
+
             const message = messageOverride || this.messageInput.value.trim();
             if (!message || !this.isConnected) return;
             
@@ -431,7 +502,7 @@
                 const response = await fetch('/api/chat/send-message', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ message: message })
+                    body: JSON.stringify({ sessionId: this.sessionId, message: message })
                 });
                 
                 const result = await response.json();
@@ -444,7 +515,9 @@
         }
 
         startEventStream() {
-            this.eventSource = new EventSource('/api/chat/stream');
+            if (!this.sessionId) return;
+
+            this.eventSource = new EventSource(`/api/chat/stream?sessionId=${this.sessionId}`);
 
             this.eventSource.onmessage = (event) => {
                 try {
@@ -617,12 +690,13 @@
             // Update buttons
             this.connectBtn.textContent = connected ? 'Disconnect' : 'Connect';
             this.connectBtn.className = `btn ${connected ? 'btn-danger' : 'btn-primary'}`;
+            this.connectBtn.disabled = !this.sessionId;
 
             this.voiceToggleBtn.textContent = recording ? '🔇 Stop Voice' : '🎤 Start Voice';
             this.voiceToggleBtn.disabled = !connected;
 
             // Update download button - only enabled when disconnected
-            this.downloadBtn.disabled = connected;
+            this.downloadBtn.disabled = connected || !this.sessionId;
 
             // Update input
             this.messageInput.disabled = !connected;

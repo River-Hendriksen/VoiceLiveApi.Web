@@ -12,8 +12,9 @@ namespace VoiceLiveApi.Web
             builder.Services.AddRazorPages();
             builder.Services.AddControllers();
             
-            // Register conversation history service as singleton
+            // Register services as singletons for multi-session support
             builder.Services.AddSingleton<IConversationHistoryService, ConversationHistoryService>();
+            builder.Services.AddSingleton<ISessionManager, SessionManager>();
 
             var app = builder.Build();
 

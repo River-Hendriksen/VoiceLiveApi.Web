@@ -4,8 +4,10 @@ namespace VoiceLiveApi.Web.Services
 {
     public interface IConversationHistoryService
     {
-        void AddMessage(string message);
-        void ClearHistory();
-        IList<string> GetHistory();
+        void AddMessage(string sessionId, string message);
+        void ClearHistory(string sessionId);
+        IList<string> GetHistory(string sessionId);
+        void RemoveSession(string sessionId);
+        int GetActiveSessionCount();
     }
 }
