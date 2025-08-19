@@ -19,12 +19,26 @@
                         <div>
                             <span class="badge bg-secondary" id="connectionStatus">Disconnected</span>
                             <span class="badge bg-secondary" id="voiceStatus">Voice Off</span>
+                            <span class="badge bg-secondary" id="audioStatus">Audio Ready</span>
                         </div>
                         <div>
                             <button type="button" class="btn btn-primary" id="connectBtn">Connect</button>
                             <button type="button" class="btn btn-secondary" id="voiceToggleBtn" disabled>🎤 Start Voice</button>
                             <button type="button" class="btn btn-outline-info" id="downloadBtn" disabled>📥 Download History</button>
                         </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Audio Level Indicator -->
+            <div class="card mb-3" id="audioLevelCard" style="display: none;">
+                <div class="card-body">
+                    <div class="d-flex align-items-center">
+                        <span class="me-2">🎤 Audio Level:</span>
+                        <div class="progress flex-grow-1 me-2" style="height: 20px;">
+                            <div class="progress-bar bg-success" id="audioLevel" role="progressbar" style="width: 0%"></div>
+                        </div>
+                        <span class="badge bg-info" id="audioLevelText">0%</span>
                     </div>
                 </div>
             </div>
@@ -64,34 +78,58 @@
             this.isRecording = false;
             this.eventSource = null;
             this.currentTextResponse = '';
+            this.mediaStream = null;
+            this.audioContext = null;
+            this.audioProcessor = null;
+            this.analyser = null;
+            this.audioLevelInterval = null;
 
             this.initializeElements();
             this.bindEvents();
             this.checkStatus();
             this.initializeAudio();
-
         }
 
-        async initializeAudio(){
-            const constraints = {
-                        audio: {
-                            echoCancellation: true,
-                            noiseSuppression: true,
-                            autoGainControl: true,
-                            sampleRate: 44100,
-                            channelCount: 1,
-                            // Additional constraints for better echo cancellation
-                            googEchoCancellation: true,
-                            googAutoGainControl: true,
-                            googNoiseSuppression: true,
-                            googHighpassFilter: true,
-                            googEchoCancellation2: true,
-                            googDAEchoCancellation: true
-                        }
-                    };
+        async initializeAudio() {
+            try {
+                const constraints = {
+                    audio: {
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true,
+                        sampleRate: 24000, // Voice Live API expects 24kHz
+                        channelCount: 1,
+                        // Additional constraints for better audio quality
+                        googEchoCancellation: true,
+                        googAutoGainControl: true,
+                        googNoiseSuppression: true,
+                        googHighpassFilter: true
+                    }
+                };
 
-            // Request microphone access with enhanced constraints
-            this.mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
+                // Request microphone access
+                this.mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
+                
+                // Create audio context for processing
+                this.audioContext = new (window.AudioContext || window.webkitAudioContext)({
+                    sampleRate: 24000 // Match Voice Live API requirements
+                });
+
+                // Create analyser for audio level monitoring
+                this.analyser = this.audioContext.createAnalyser();
+                this.analyser.fftSize = 256;
+
+                // Connect media stream to analyser
+                const source = this.audioContext.createMediaStreamSource(this.mediaStream);
+                source.connect(this.analyser);
+
+                this.updateAudioStatus('Audio Ready', 'bg-success');
+                this.addMessage('system', 'Microphone access granted and audio system initialized');
+            } catch (error) {
+                console.error('Error initializing audio:', error);
+                this.updateAudioStatus('Audio Error', 'bg-danger');
+                this.addMessage('error', `Audio initialization failed: ${error.message}`);
+            }
         }
 
         initializeElements() {
@@ -102,8 +140,12 @@
             this.chatMessages = document.getElementById('chatMessages');
             this.connectionStatus = document.getElementById('connectionStatus');
             this.voiceStatus = document.getElementById('voiceStatus');
+            this.audioStatus = document.getElementById('audioStatus');
             this.audioPlayer = document.getElementById('audioPlayer');
             this.downloadBtn = document.getElementById('downloadBtn');
+            this.audioLevelCard = document.getElementById('audioLevelCard');
+            this.audioLevel = document.getElementById('audioLevel');
+            this.audioLevelText = document.getElementById('audioLevelText');
         }
 
         bindEvents() {
@@ -145,6 +187,7 @@
                     this.updateUI(true, false);
                     this.addMessage('system', result.message);
                     this.startEventStream();
+                    this.sendMessage('Hello');
                 } else {
                     this.addMessage('error', `Connection failed: ${result.error}`);
                 }
@@ -155,6 +198,11 @@
 
         async disconnect() {
             try {
+                // Stop recording if active
+                if (this.isRecording) {
+                    await this.stopVoiceRecording();
+                }
+
                 if (this.eventSource) {
                     this.eventSource.close();
                     this.eventSource = null;
@@ -173,21 +221,163 @@
         }
 
         async toggleVoice() {
+            if (!this.isRecording) {
+                await this.startVoiceRecording();
+            } else {
+                await this.stopVoiceRecording();
+            }
+        }
+
+        async startVoiceRecording() {
             try {
+                if (!this.audioContext || !this.mediaStream) {
+                    throw new Error('Audio system not initialized');
+                }
+
+                // Resume audio context if suspended
+                if (this.audioContext.state === 'suspended') {
+                    await this.audioContext.resume();
+                }
+
+                // Create audio processor for sending data to server
+                await this.createAudioProcessor();
+
+                // Show audio level indicator
+                this.audioLevelCard.style.display = 'block';
+                this.startAudioLevelMonitoring();
+
+                // Start recording on server
+                const response = await fetch('/api/chat/toggle-voice', { method: 'POST' });
+                const result = await response.json();
+
+                if (response.ok && result.isRecording) {
+                    this.isRecording = true;
+                    this.updateUI(this.isConnected, true);
+                    this.addMessage('system', result.message);
+                } else {
+                    throw new Error(result.error || 'Failed to start recording');
+                }
+            } catch (error) {
+                this.addMessage('error', `Voice recording error: ${error.message}`);
+                await this.stopVoiceRecording();
+            }
+        }
+
+        async stopVoiceRecording() {
+            try {
+                // Stop audio processor
+                if (this.audioProcessor) {
+                    this.audioProcessor.disconnect();
+                    this.audioProcessor = null;
+                }
+
+                // Hide audio level indicator
+                this.audioLevelCard.style.display = 'none';
+                this.stopAudioLevelMonitoring();
+
+                // Stop recording on server
                 const response = await fetch('/api/chat/toggle-voice', { method: 'POST' });
                 const result = await response.json();
 
                 if (response.ok) {
-                    this.isRecording = result.isRecording;
-                    if(this.isRecording) await this.sendMessage('Hello');
-                    this.updateUI(this.isConnected, this.isRecording);
-                    this.addMessage('system', result.message);                    
+                    this.isRecording = false;
+                    this.updateUI(this.isConnected, false);
+                    this.addMessage('system', result.message);
                 } else {
-                    this.addMessage('error', `Voice toggle failed: ${result.error}`);
+                    this.addMessage('error', `Stop recording failed: ${result.error}`);
                 }
             } catch (error) {
-                this.addMessage('error', `Voice error: ${error.message}`);
+                this.addMessage('error', `Stop recording error: ${error.message}`);
             }
+        }
+
+        async createAudioProcessor() {
+            try {
+                // Create ScriptProcessorNode for audio processing
+                this.audioProcessor = this.audioContext.createScriptProcessor(4096, 1, 1);
+                
+                const source = this.audioContext.createMediaStreamSource(this.mediaStream);
+                source.connect(this.audioProcessor);
+                this.audioProcessor.connect(this.audioContext.destination);
+
+                this.audioProcessor.onaudioprocess = async (event) => {
+                    if (!this.isRecording) return;
+
+                    const inputBuffer = event.inputBuffer;
+                    const inputData = inputBuffer.getChannelData(0);
+
+                    // Convert float32 to PCM16
+                    const pcm16Buffer = new Int16Array(inputData.length);
+                    for (let i = 0; i < inputData.length; i++) {
+                        const sample = Math.max(-1, Math.min(1, inputData[i]));
+                        pcm16Buffer[i] = sample * 0x7FFF;
+                    }
+
+                    // Convert to base64 for transmission
+                    const uint8Array = new Uint8Array(pcm16Buffer.buffer);
+                    const base64Audio = btoa(String.fromCharCode.apply(null, uint8Array));
+
+                    // Send audio data to server
+                    await this.sendAudioData(base64Audio);
+                };
+            } catch (error) {
+                console.error('Error creating audio processor:', error);
+                throw error;
+            }
+        }
+
+        async sendAudioData(base64Audio) {
+            try {
+                if (!this.isConnected || !this.isRecording) return;
+
+                await fetch('/api/chat/send-audio', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ audioData: base64Audio })
+                });
+            } catch (error) {
+                console.error('Error sending audio data:', error);
+            }
+        }
+
+        startAudioLevelMonitoring() {
+            if (!this.analyser) return;
+
+            const bufferLength = this.analyser.frequencyBinCount;
+            const dataArray = new Uint8Array(bufferLength);
+
+            this.audioLevelInterval = setInterval(() => {
+                this.analyser.getByteFrequencyData(dataArray);
+                
+                // Calculate average audio level
+                let sum = 0;
+                for (let i = 0; i < bufferLength; i++) {
+                    sum += dataArray[i];
+                }
+                const average = sum / bufferLength;
+                const percentage = Math.round((average / 255) * 100);
+
+                // Update UI
+                this.audioLevel.style.width = `${percentage}%`;
+                this.audioLevelText.textContent = `${percentage}%`;
+
+                // Change color based on level
+                this.audioLevel.className = percentage > 50 ? 'progress-bar bg-warning' : 
+                                          percentage > 20 ? 'progress-bar bg-info' : 
+                                          'progress-bar bg-success';
+            }, 100);
+        }
+
+        stopAudioLevelMonitoring() {
+            if (this.audioLevelInterval) {
+                clearInterval(this.audioLevelInterval);
+                this.audioLevelInterval = null;
+            }
+        }
+
+        updateAudioStatus(text, badgeClass) {
+            this.audioStatus.textContent = text;
+            this.audioStatus.className = `badge ${badgeClass}`;
         }
 
         async downloadConversationHistory() {
@@ -231,16 +421,19 @@
         async sendMessage(messageOverride = null) {
             const message = messageOverride || this.messageInput.value.trim();
             if (!message || !this.isConnected) return;
+            
             try {
-                if(!messageOverride) {
+                if (!messageOverride) {
                     this.addMessage('user', message);
                     this.messageInput.value = '';
                 }
+                
                 const response = await fetch('/api/chat/send-message', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ message: message })
                 });
+                
                 const result = await response.json();
                 if (!response.ok) {
                     this.addMessage('error', `Send failed: ${result.error}`);
@@ -277,6 +470,24 @@
                 case 'session_created':
                 case 'session_updated':
                     this.addMessage('system', data.message);
+                    break;
+
+                case 'speech_started':
+                    this.addMessage('system', '🎤 Speech detected in your audio');
+                    break;
+
+                case 'speech_stopped':
+                    this.addMessage('system', '🔇 Speech ended, processing...');
+                    break;
+
+                case 'audio_committed':
+                    this.addMessage('system', '✅ Audio processed and committed');
+                    break;
+
+                case 'user_speech_transcribed':
+                    // Display the recognized speech text
+                    this.addMessage('user', `🗣️ "${data.text}"`);
+                    this.addMessage('system', '✅ Speech recognized and transcribed');
                     break;
 
                 case 'response_started':
@@ -400,7 +611,7 @@
             this.connectionStatus.className = `badge ${connected ? 'bg-success' : 'bg-secondary'}`;
 
             // Update voice status
-            this.voiceStatus.textContent = recording ? 'Voice On' : 'Voice Off';
+            this.voiceStatus.textContent = recording ? 'Recording' : 'Voice Off';
             this.voiceStatus.className = `badge ${recording ? 'bg-warning' : 'bg-secondary'}`;
 
             // Update buttons

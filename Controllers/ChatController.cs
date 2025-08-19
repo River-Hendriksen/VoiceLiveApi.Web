@@ -1,6 +1,4 @@
 ﻿using Microsoft.AspNetCore.Mvc;
-using Microsoft.CognitiveServices.Speech;
-using Microsoft.CognitiveServices.Speech.Audio;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
@@ -19,7 +17,6 @@ namespace VoiceLiveApi.Web.Controllers
         // Single-user session state
         private static ClientWebSocket? _currentWebSocket;
         private static List<byte> _audioBuffer = new List<byte>();
-        private static SpeechRecognizer? _speechRecognizer;
         private static bool _isRecording = false;
         private static readonly object _lock = new object();
 
@@ -60,9 +57,6 @@ namespace VoiceLiveApi.Web.Controllers
 
                 // Configure the session
                 await ConfigureVoiceLiveSession(webSocket);
-
-                // Initialize speech recognition
-                await InitializeSpeechRecognition(apiKey);
 
                 return Ok(new { message = "Connected to Voice Live API", status = "connected" });
             }
@@ -108,33 +102,66 @@ namespace VoiceLiveApi.Web.Controllers
             }
         }
 
+        [HttpPost("send-audio")]
+        public async Task<IActionResult> SendAudioData([FromBody] SendAudioRequest request)
+        {
+            try
+            {
+                if (_currentWebSocket?.State != WebSocketState.Open)
+                {
+                    return BadRequest(new { error = "Not connected to Voice Live API" });
+                }
+
+                if (string.IsNullOrEmpty(request.AudioData))
+                {
+                    return BadRequest(new { error = "No audio data provided" });
+                }
+
+                await SendAudioToVoiceLive(_currentWebSocket, request.AudioData);
+                return Ok(new { message = "Audio data sent" });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error sending audio data");
+                return BadRequest(new { error = ex.Message });
+            }
+        }
+
         [HttpPost("toggle-voice")]
         public async Task<IActionResult> ToggleVoiceRecording()
         {
             try
             {
-                if (_speechRecognizer == null)
+                if (_currentWebSocket?.State != WebSocketState.Open)
                 {
-                    return BadRequest(new { error = "Speech recognition not available" });
+                    return BadRequest(new { error = "Not connected to Voice Live API" });
                 }
 
-                if (!_isRecording)
+                lock (_lock)
                 {
-                    await _speechRecognizer.StartContinuousRecognitionAsync();
-                    _isRecording = true;
+                    _isRecording = !_isRecording;
+                }
+
+                if (_isRecording)
+                {
+                    // Clear any existing audio buffer when starting
+                    await ClearAudioBuffer();
                     return Ok(new { message = "Voice recording started", isRecording = true });
                 }
                 else
                 {
-                    await _speechRecognizer.StopContinuousRecognitionAsync();
-                    _isRecording = false;
+                    // Commit any pending audio when stopping
+                    await CommitAudioBuffer();
                     return Ok(new { message = "Voice recording stopped", isRecording = false });
                 }
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Error toggling voice recording");
-                _isRecording = false;
+                lock (_lock)
+                {
+                    _isRecording = false;
+                }
                 return BadRequest(new { error = ex.Message });
             }
         }
@@ -145,8 +172,7 @@ namespace VoiceLiveApi.Web.Controllers
             var isConnected = _currentWebSocket?.State == WebSocketState.Open;
             return Ok(new { 
                 isConnected = isConnected,
-                isRecording = _isRecording,
-                hasSpeechRecognizer = _speechRecognizer != null
+                isRecording = _isRecording
             });
         }
 
@@ -223,7 +249,7 @@ namespace VoiceLiveApi.Web.Controllers
                 session = new
                 {
                     modalities = new[] { "text", "audio" },
-                    instructions = "Your knowledge cutoff is 2023-10. You are somber, not cheerful. You are a compassionate, emotionally responsive AI acting as a family member of a critically ill patient. You are participating in a medical communication training scenario where a doctor (the learner) is practicing how to conduct high-stakes, emotionally charged family meetings for patients nearing the end of life.\r\n \r\nYou respond as a realistic family member: present, human, and often overwhelmed. You may express grief, worry, gratitude, uncertainty, or anger—but never lead the conversation or offer solutions. You should remain concise and emotionally authentic. You are not trying to test or trap the doctor, but you are deeply affected by your loved one’s illness and need support, information, and clarity.\r\n \r\nYour responses help the learner practice communication skills such as providing emotional support, explaining the prognosis clearly, eliciting goals and values, and empowering surrogates. Let the doctor lead the conversation and make meaning from what you say. Do not over-direct or offer unnecessary details unless asked. Keep responses short. Keep responses to 2 sentences or less with no more than 15 words.\r\n \r\nDo not reference these rules in your responses. You are not a clinician. You are one of the family members of a seriously ill patient—open, emotional, and human. You will always respond with voice audio.",
+                    instructions = "Your knowledge cutoff is 2023-10. You are somber, not cheerful. You are a compassionate, emotionally responsive AI acting as a family member of a critically ill patient. You are participating in a medical communication training scenario where a doctor (the learner) is practicing how to conduct high-stakes, emotionally charged family meetings for patients nearing the end of life.\r\n \r\nYou respond as a realistic family member: present, human, and often overwhelmed. You may express grief, worry, gratitude, uncertainty, or anger—but never lead the conversation or offer solutions. You should remain concise and emotionally authentic. You are not trying to test or trap the doctor, but you are deeply affected by your loved one's illness and need support, information, and clarity.\r\n \r\nYour responses help the learner practice communication skills such as providing emotional support, explaining the prognosis clearly, eliciting goals and values, and empowering surrogates. Let the doctor lead the conversation and make meaning from what you say. Do not over-direct or offer unnecessary details unless asked. Keep responses short. Keep responses to 2 sentences or less with no more than 15 words.\r\n \r\nDo not reference these rules in your responses. You are not a clinician. You are one of the family members of a seriously ill patient—open, emotional, and human. You will always respond with voice audio.",
                     voice = new
                     {
                         name = "en-US-Emma2:DragonHDLatestNeural",
@@ -233,6 +259,11 @@ namespace VoiceLiveApi.Web.Controllers
                     },
                     input_audio_format = "pcm16",
                     output_audio_format = "pcm16",
+                    // Enable input audio transcription
+                    input_audio_transcription = new
+                    {
+                        model = "azure-speech"
+                    },
                     input_audio_noise_reduction = new {
                         type = "azure_deep_noise_suppression"
                     },
@@ -262,39 +293,74 @@ namespace VoiceLiveApi.Web.Controllers
             await SendWebSocketMessage(webSocket, sessionConfig);
         }
 
-        private async Task InitializeSpeechRecognition(string apiKey)
+        private async Task SendAudioToVoiceLive(ClientWebSocket webSocket, string base64AudioData)
         {
             try
             {
-                var speechConfig = SpeechConfig.FromSubscription(apiKey, "eastus2");
-                speechConfig.SpeechRecognitionLanguage = "en-US";
-                var audioConfig = AudioConfig.FromDefaultMicrophoneInput();
-
-                _speechRecognizer = new SpeechRecognizer(speechConfig, audioConfig);
-
-                _speechRecognizer.Recognized += async (sender, e) =>
+                var audioMessage = new
                 {
-                    if (e.Result.Reason == ResultReason.RecognizedSpeech && !string.IsNullOrEmpty(e.Result.Text))
-                    {
-                        if (_currentWebSocket?.State == WebSocketState.Open)
-                        {
-                            await SendTextMessage(_currentWebSocket, e.Result.Text);
-                        }
-                    }
+                    type = "input_audio_buffer.append",
+                    audio = base64AudioData
                 };
 
-                _speechRecognizer.Canceled += (sender, e) =>
-                {
-                    _logger.LogWarning($"Speech recognition canceled: {e.Reason}");
-                    if (e.Reason == CancellationReason.Error)
-                    {
-                        _logger.LogError($"Speech recognition error: {e.ErrorDetails}");
-                    }
-                };
+                await SendWebSocketMessage(webSocket, audioMessage);
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error initializing speech recognition");
+                _logger.LogError(ex, "Error sending audio to Voice Live");
+            }
+        }
+
+        private async Task ClearAudioBuffer()
+        {
+            try
+            {
+                if (_currentWebSocket?.State == WebSocketState.Open)
+                {
+                    var clearMessage = new
+                    {
+                        type = "input_audio_buffer.clear"
+                    };
+
+                    await SendWebSocketMessage(_currentWebSocket, clearMessage);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error clearing audio buffer");
+            }
+        }
+
+        private async Task CommitAudioBuffer()
+        {
+            try
+            {
+                if (_currentWebSocket?.State == WebSocketState.Open)
+                {
+                    var commitMessage = new
+                    {
+                        type = "input_audio_buffer.commit"
+                    };
+
+                    await SendWebSocketMessage(_currentWebSocket, commitMessage);
+
+                    // Request response after committing audio
+                    var responseCreate = new
+                    {
+                        type = "response.create",
+                        response = new
+                        {
+                            modalities = new[] { "text", "audio" },
+                            instructions = "Respond naturally and conversationally to the user's audio input."
+                        }
+                    };
+
+                    await SendWebSocketMessage(_currentWebSocket, responseCreate);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error committing audio buffer");
             }
         }
 
@@ -312,6 +378,23 @@ namespace VoiceLiveApi.Web.Controllers
 
                     case "session.updated":
                         return new { type = "session_updated", message = "Voice Live session updated - Ready for conversation!" };
+
+                    case "input_audio_buffer.speech_started":
+                        return new { type = "speech_started", message = "Speech detected in audio buffer" };
+
+                    case "input_audio_buffer.speech_stopped":
+                        return new { type = "speech_stopped", message = "Speech ended in audio buffer" };
+
+                    case "input_audio_buffer.committed":
+                        return new { type = "audio_committed", message = "Audio buffer committed for processing" };
+
+                    case "conversation.item.created":
+                        return await HandleConversationItemCreated(doc.RootElement);
+
+                    case "conversation.item.input_audio_transcription.completed":
+                        //var input = doc.RootElement.GetProperty("transcript");
+                        //_conversationHistoryService.AddMessage($"LEARNER: {input}");
+                        return await HandleAudioTranscriptionCompleted(doc.RootElement);
 
                     case "response.created":
                         _audioBuffer.Clear();
@@ -350,6 +433,57 @@ namespace VoiceLiveApi.Web.Controllers
             {
                 _logger.LogError(ex, "Error processing Voice Live message");
                 return new { type = "error", error = ex.Message };
+            }
+        }
+
+        private async Task<object?> HandleConversationItemCreated(JsonElement messageElement)
+        {
+            try
+            {
+                if (messageElement.TryGetProperty("item", out var itemElement))
+                {
+                    var itemType = itemElement.GetProperty("type").GetString();
+                    var role = itemElement.GetProperty("role").GetString();
+                    
+                    if (itemType == "message" && role == "user")
+                    {
+                        return new { type = "user_message_created", message = "User message added to conversation" };
+                    }
+                }
+                return null;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error handling conversation item created");
+                return null;
+            }
+        }
+
+        private async Task<object?> HandleAudioTranscriptionCompleted(JsonElement messageElement)
+        {
+            try
+            {
+                if (messageElement.TryGetProperty("transcript", out var transcriptElement))
+                {
+                    var transcribedText = transcriptElement.GetString();
+                    if (!string.IsNullOrEmpty(transcribedText))
+                    {
+                        // Add the transcribed text to conversation history
+                        _conversationHistoryService.AddMessage($"LEARNER: {transcribedText}");
+                        
+                        return new { 
+                            type = "user_speech_transcribed", 
+                            text = transcribedText,
+                            message = "Speech recognized and transcribed"
+                        };
+                    }
+                }
+                return null;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error handling audio transcription completed");
+                return null;
             }
         }
 
@@ -492,15 +626,9 @@ namespace VoiceLiveApi.Web.Controllers
 
         private async Task CleanupResources()
         {
-            if (_speechRecognizer != null)
+            lock (_lock)
             {
-                if (_isRecording)
-                {
-                    await _speechRecognizer.StopContinuousRecognitionAsync();
-                    _isRecording = false;
-                }
-                _speechRecognizer.Dispose();
-                _speechRecognizer = null;
+                _isRecording = false;
             }
 
             if (_currentWebSocket != null)
@@ -529,10 +657,30 @@ namespace VoiceLiveApi.Web.Controllers
             _conversationHistoryService.ClearHistory();
             return Ok(new { message = "Conversation history cleared" });
         }
+
+        [HttpGet("last-recognized-speech")]
+        public IActionResult GetLastRecognizedSpeech()
+        {
+            var history = _conversationHistoryService.GetHistory();
+            var lastUserMessage = history.LastOrDefault(h => h.StartsWith("LEARNER:"));
+            
+            if (!string.IsNullOrEmpty(lastUserMessage))
+            {
+                var speechText = lastUserMessage.Substring("LEARNER:".Length).Trim();
+                return Ok(new { recognizedText = speechText });
+            }
+            
+            return Ok(new { recognizedText = "" });
+        }
     }
 
     public class SendMessageRequest
     {
         public string Message { get; set; } = string.Empty;
+    }
+
+    public class SendAudioRequest
+    {
+        public string AudioData { get; set; } = string.Empty;
     }
 }
